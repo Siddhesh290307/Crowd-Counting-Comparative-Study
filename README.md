@@ -335,7 +335,7 @@ The density MSE is scaled by the number of pixels so it does not vanish numerica
 
 | Metric | Value |
 |--------|-------|
-| Test MAE | reported from best checkpoint |
+| Test MAE | ~140 |
 | Test RMSE | reported from best checkpoint |
 
 ---
@@ -347,7 +347,7 @@ The density MSE is scaled by the number of pixels so it does not vanish numerica
 | 1 | CSRNet + MLP | ~130 |
 | 2 | Patch‑based classification + regression | 204.21 |
 | 3 | Router‑based hybrid | 91.23 (hybrid) / 74.77 (ViT only) |
-| 4 | VMambaCC-inspired (density map) | see checkpoint output |
+| 4 | VMambaCC-inspired (density map) | ~140 |
 
 ### Key Takeaways
 
