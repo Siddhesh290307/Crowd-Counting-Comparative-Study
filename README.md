@@ -1,11 +1,12 @@
 # Crowd Counting Experiments on Shanghai TechA
 
-This repository contains three crowd‑counting experiments using the Shanghai TechA dataset.  
-Each experiment explores a different architectural strategy:  
+This repository contains four crowd‑counting experiments using the Shanghai TechA dataset.  
+Each experiment explores a different architectural strategy:
 
-1. **CSRNet with an MLP bridge** – a density‑map regression model that adds a channel‑wise MLP between the frontend and backend.  
-2. **Patch‑based classification + regression** – a two‑stage approach that first classifies patches into density levels, then applies specialised counters.  
-3. **Router‑based hybrid density estimation** – a ResNet‑18 router selects between a CNN and a ViT counter (with soft fusion for uncertain patches).  
+1. **CSRNet with an MLP bridge** – a density‑map regression model that adds a channel‑wise MLP between the frontend and backend.
+2. **Patch‑based classification + regression** – a two‑stage approach that first classifies patches into density levels, then applies specialised counters.
+3. **Router‑based hybrid density estimation** – a ResNet‑18 router selects between a CNN and a ViT counter (with soft fusion for uncertain patches).
+4. **VMambaCC-inspired density estimation** – a Visual State Space backbone with MHF attention and HS2FPN decoder adapted for density‑map regression.
 
 All models are implemented in PyTorch and evaluated using Mean Absolute Error (MAE).
 
@@ -13,8 +14,8 @@ All models are implemented in PyTorch and evaluated using Mean Absolute Error (M
 
 ## Dataset: Shanghai TechA
 
-- **Part A** of the ShanghaiTech dataset contains 482 images with highly varying crowd densities.  
-- We use the official training/test split (300 training, 182 testing).  
+- **Part A** of the ShanghaiTech dataset contains 482 images with highly varying crowd densities.
+- We use the official training/test split (300 training, 182 testing).
 - Ground‑truth density maps are generated using Gaussian kernels (σ adapted to head sizes).
 
 ---
@@ -97,6 +98,7 @@ class PatchClassifier(nn.Module):
         self.fc = nn.Linear(64,3)
     ...
 ```
+
 **Accuracy: 78.5%** on patch classification.
 
 ## Patch Routing Visualization
@@ -175,6 +177,169 @@ class HybridDensity(nn.Module):
 
 ---
 
+## Experiment 4: VMambaCC-Inspired Density Estimation
+
+> **Note:** This is a PyTorch approximation inspired by the VMambaCC paper (Ma et al., ACM MM 2024). The exact VMamba / Selective State Space (SSM) kernel is not publicly released; the VSS block uses a depthwise-conv approximation that mimics the linear-complexity global-scan behaviour. Architecture components (MHF attention, HS2FPN) follow the paper's design.
+
+### Architecture
+
+The model follows a three-stage pipeline:
+
+```
+Input → VMamba Backbone (F1/F2/F3) → HS2FPN Decoder → Density Head
+```
+
+#### 4.1 VSS Block (Visual State Space — approximation)
+
+The VSS block replaces the official selective scan with a depthwise long-range convolution plus channel-mix linear layers, serving as a lightweight stand-in for the Mamba SSM kernel.
+
+```python
+class VSSBlock(nn.Module):
+    def __init__(self, dim: int, d_state: int = 16, expand: int = 2):
+        super().__init__()
+        inner_dim = dim * expand
+        self.norm    = nn.LayerNorm(dim)
+        self.proj_in = nn.Linear(dim, inner_dim * 2)
+        self.dw_conv = nn.Conv2d(
+            inner_dim, inner_dim,
+            kernel_size=7, padding=3,
+            groups=inner_dim, bias=False
+        )
+        self.ssm_mix = nn.Sequential(
+            nn.Linear(inner_dim, inner_dim),
+            nn.SiLU(),
+            nn.Linear(inner_dim, dim),
+        )
+        self.norm_out = nn.LayerNorm(dim)
+    ...
+```
+
+#### 4.2 MHF Attention (Multi-head High-level Feature)
+
+MHF attention is composed of three sub-modules that progressively refine cross-scale feature interaction:
+
+- **CEM (Channel Enhancement Module)** – uses global max and average pooling to compute channel-wise attention weights, suppressing uninformative channels from the high-level features.
+- **MSEM (Multi-head Spatial Enhancement Module)** – splits the channel dimension into `n_heads` groups and applies independent spatial attention (max + avg pooled maps fed through a 3×3 conv) per group.
+- **HCEM (High-level Channel Enhancement Module)** – transfers semantic attention from the higher-resolution feature map to the lower-resolution one, enabling guided top-down feature modulation.
+
+```python
+class MHFAttention(nn.Module):
+    """Full MHF attention block (§3.2)."""
+    def __init__(self, hi_dim: int, lo_dim: int, n_heads: int = 4):
+        super().__init__()
+        self.cem  = CEM(hi_dim)
+        self.msem = MSEM(hi_dim, n_heads=n_heads)
+        self.hcem = HCEM(hi_dim, lo_dim)
+    def forward(self, fh: torch.Tensor, fl: torch.Tensor) -> torch.Tensor:
+        out1 = self.cem(fh)
+        out2 = self.msem(out1)
+        out4 = self.hcem(out2, fl)
+        return out4
+```
+
+#### 4.3 VMamba Backbone
+
+A lightweight three-scale feature extractor producing feature maps at strides 8, 16, and 32 relative to the input. Each scale applies a strided conv downsampling followed by a stack of VSS blocks.
+
+```python
+class VMambaBackbone(nn.Module):
+    def __init__(self,
+                 in_ch:  int   = 3,
+                 dims:   tuple = (96, 192, 384),
+                 depths: tuple = (2,  2,   4)):
+        super().__init__()
+        self.stem   = nn.Sequential(
+            nn.Conv2d(in_ch, dims[0], kernel_size=4, stride=4), ...)
+        self.down1  = ...  # stride-2 conv
+        self.stage1 = nn.Sequential(*[VSSBlock(dims[0]) for _ in range(depths[0])])
+        self.down2  = ...
+        self.stage2 = nn.Sequential(*[VSSBlock(dims[1]) for _ in range(depths[1])])
+        self.down3  = ...
+        self.stage3 = nn.Sequential(*[VSSBlock(dims[2]) for _ in range(depths[2])])
+```
+
+#### 4.4 HS2FPN Decoder (High-level Semantic Supervised FPN)
+
+A top-down feature pyramid that fuses the three backbone scales using MHF attention at each merge step. Explicit channel projection convolutions align dimensions before fusion.
+
+```python
+class HS2FPN(nn.Module):
+    def forward(self, f1, f2, f3):
+        # Merge stride-32 into stride-16
+        f3_proj = self.proj_32_to_16(f3)
+        f3_up   = F.interpolate(f3_proj, size=f2.shape[-2:], ...)
+        f2_mhf  = self.mhf_32_to_16(f3_up, self.lat_16(f2))
+        fuse16  = self.vss_16(f2_mhf + f3_up)
+
+        # Merge stride-16 into stride-8
+        fuse16_up = F.interpolate(self.proj_16_to_8(fuse16), size=f1.shape[-2:], ...)
+        f1_mhf    = self.mhf_16_to_8(fuse16_up, self.lat_8(f1))
+        fuse8     = self.vss_8(f1_mhf + fuse16_up)
+
+        return self.proj_out(fuse8)
+```
+
+#### 4.5 Density Head
+
+A lightweight regression head that maps the decoder output to a single-channel, non-negative density map. `Softplus` activation ensures positivity. The output is bilinearly upsampled to the input resolution.
+
+```python
+class DensityHead(nn.Module):
+    def __init__(self, in_dim: int = 96, img_size: int = 512, init_count: float = 100.0):
+        super().__init__()
+        self.conv     = nn.Sequential(nn.Conv2d(in_dim, in_dim // 2, 3, padding=1), nn.ReLU())
+        self.out_conv = nn.Conv2d(in_dim // 2, 1, 1)
+        self.activation = nn.Softplus()
+```
+
+### Loss Function
+
+A combined spatial and count objective is used during training:
+
+```
+density_loss = MSE(pred_density, gt_density) × (H × W)
+count_loss   = L1(sum(pred_density), sum(gt_density))
+total_loss   = density_loss + λ × count_loss        (λ = 1e-3)
+```
+
+The density MSE is scaled by the number of pixels so it does not vanish numerically for large input resolutions. Validation count MAE is used for checkpoint selection with early stopping (patience = 15).
+
+### Training Details
+
+| Hyperparameter | Value |
+|----------------|-------|
+| Image size | 512 × 512 |
+| Backbone dims | (96, 192, 384) |
+| Backbone depths | (2, 2, 4) |
+| Epochs | 50 (early stopping) |
+| Optimiser | AdamW (lr = 1e-4, wd = 1e-4) |
+| Scheduler | CosineAnnealingLR (η_min = 1e-6) |
+| Gradient clipping | max norm 5.0 |
+| λ_count | 1e-3 |
+| Gaussian σ (density maps) | 15.0 |
+
+### Component Summary
+
+| Component | Paper reference | Implementation |
+|-----------|----------------|----------------|
+| VSS Block | Sec. 3.1, VMamba Cross-Scan | Depthwise-conv approximation; not official selective scan |
+| MHF – CEM | Sec. 3.2.1, eq. (1–4) | Exact |
+| MHF – MSEM | Sec. 3.2.2, eq. (5–6) | Exact (4 heads) |
+| MHF – HCEM | Sec. 3.2.3, eq. (7–8) | Exact |
+| HS2FPN | Sec. 3.3, eq. (9) | Top-down FPN with explicit channel projections |
+| Output head | Point-based (paper) | Replaced with Gaussian density map + Softplus |
+
+> The main departure from the original VMambaCC paper is the **output representation**: the paper uses a point-based head (predicted points + confidence scores); this implementation replaces that with a **Gaussian-kernel density map** output, evaluated with count MAE/RMSE.
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| Test MAE | reported from best checkpoint |
+| Test RMSE | reported from best checkpoint |
+
+---
+
 ## Summary of Results
 
 | Experiment | Model / Approach | MAE |
@@ -182,13 +347,15 @@ class HybridDensity(nn.Module):
 | 1 | CSRNet + MLP | ~130 |
 | 2 | Patch‑based classification + regression | 204.21 |
 | 3 | Router‑based hybrid | 91.23 (hybrid) / 74.77 (ViT only) |
+| 4 | VMambaCC-inspired (density map) | see checkpoint output |
 
 ### Key Takeaways
 
-- Adding an MLP bridge to CSRNet improves feature refinement and yields a reasonable MAE (130).
+- Adding an MLP bridge to CSRNet improves feature refinement and yields a reasonable MAE (~130).
 - A simple patch‑based classification + regression approach is insufficient for this challenging dataset.
 - A well‑trained ViT can achieve strong performance (74.77 MAE) on Shanghai TechA.
 - Router‑guided mixture of experts is promising, but careful tuning of the router threshold and fusion weights is necessary to fully exploit the benefits of both counters.
+- The VMambaCC-inspired architecture brings a structured, multi-scale approach with attention-guided feature fusion (MHF + HS2FPN) and a VSS backbone, offering strong design priors for dense prediction without relying on a pretrained CNN frontend.
 
 ---
 
@@ -199,19 +366,20 @@ class HybridDensity(nn.Module):
 - torchvision
 - timm (for ViT models)
 - tqdm
+- scipy
+- opencv-python
 
 Install dependencies:
 
 ```bash
-pip install torch torchvision timm tqdm
+pip install torch torchvision timm tqdm scipy opencv-python
 ```
 
 ---
 
 ## Usage
 
-Detailed training and evaluation scripts are provided in the accompanying notebooks.
-To reproduce the results:
+Detailed training and evaluation scripts are provided in the accompanying notebooks. To reproduce the results:
 
 1. Download the Shanghai TechA dataset and place it in `data/ShanghaiTech/part_A/`.
 2. Run the notebooks (or scripts) for each experiment.
@@ -221,5 +389,4 @@ To reproduce the results:
 
 ## Acknowledgements
 
-This work was conducted as part of a crowd‑counting study using the Shanghai TechA dataset.
-We thank the authors of CSRNet, ViT, and ResNet for their open‑source implementations.
+This work was conducted as part of a crowd‑counting study using the Shanghai TechA dataset. We thank the authors of CSRNet, ViT, ResNet, and VMambaCC (Ma et al., ACM MM 2024) for their open‑source implementations.
